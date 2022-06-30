@@ -1,0 +1,143 @@
+
+#this script combines a before and after dataset to identify the files that were deleted.
+import pandas as pd
+
+#Print the before and after directories.  Need the columns 'FileHash' and 'FullName'.  This assumes that the first row should be skipped.
+Original = pd.read_csv("BeforeDirectory.csv",encoding='latin-1',skiprows=1)
+Current = pd.read_csv("AfterDirectory.csv",encoding='latin-1',skiprows=1)
+
+
+##Convert to Dataframe
+Original = pd.DataFrame(Original)
+Current = pd.DataFrame(Current)
+
+#Get the dates in right format
+Original['Created']=pd.to_datetime(Original['Created'], infer_datetime_format=True, errors = 'coerce')
+Original['LastWriteTime']=pd.to_datetime(Original['LastWriteTime'], infer_datetime_format=True, errors = 'coerce')
+Current['Created']=pd.to_datetime(Current['Created'], infer_datetime_format=True, errors = 'coerce')
+Current['LastWriteTime']=pd.to_datetime(Current['LastWriteTime'], infer_datetime_format=True, errors = 'coerce')
+#
+
+#Drop the thumbs file and the temp files
+Original['Drop'] = (Original['FullName'].str.contains("thumbs.db",case=False) | Original['FullName'].str.contains("~",case=False) | Original['FullName'].str.contains("ExampleFolders4",case=False))
+Original.drop(Original[Original['Drop'] == True ].index , inplace=True)
+
+Current['Drop'] = (Current['FullName'].str.contains("thumbs.db",case=False) | Current['FullName'].str.contains("~",case=False) | Current['FullName'].str.contains("ExampleFolders4",case=False) )
+Current.drop(Current[Current['Drop'] == True ].index , inplace=True)
+
+#Make sure dates 
+Current["New"] = Current["Created"].apply(lambda x: pd.to_datetime(x, errors='coerce')> pd.to_datetime('2021-07-21 19:05', format='%Y-%m-%d %H:%M',yearfirst=True))
+Current["Modified"] = Current["LastWriteTime"].apply(lambda x: pd.to_datetime(x, errors='coerce')> pd.to_datetime('2021-07-21 19:05', format='%Y-%m-%d %H:%M',yearfirst=True))
+
+#Calculate the total number we are going for
+
+OriginalNumber = Original.shape[0]
+CurrentNumber = Current.shape[0]
+
+
+
+#determine if file was modified but not new
+Current["ModifiedNotNew"] = (~Current.New) & Current.Modified
+
+#standardize file names
+Original['FullName'] = Original['FullName'].str.split(r'\\Private\\').str[1]
+Current['FullName'] = Current['FullName'].str.split(r'\\Private\\').str[1]
+
+#make a title column
+Original['title'] = Original['FullName'].apply(lambda x: x.rsplit('\\')[-1])
+Current['title'] = Current['FullName'].apply(lambda x: x.rsplit('\\')[-1])
+
+#count duplicates
+Original['g'] = Original.groupby('FileHash').cumcount()
+Current['g'] = Current.groupby('FileHash').cumcount()
+
+
+#create a list that identifies all the modified files
+list_of_ModifiedRecentlyButNotNew = Current.loc[Current['ModifiedNotNew']==True,'title'].tolist()
+
+#merge the files. the cumulative count ensures everything is unique upon merge
+merged_table = pd.merge(Original,Current,on=['FileHash','g'],how='outer',indicator=True)
+
+#make a column that indicates 'true' for left_only, right only and both
+merged_table['Left_onlyBool'] = merged_table['_merge']=='left_only'
+merged_table['Both_Bool'] = merged_table['_merge']=='both'
+merged_table['Right_onlyBool'] = merged_table['_merge']=='right_only'
+
+print("STATS:")
+print("difference in totals of two datasets:", OriginalNumber - CurrentNumber)
+print("recently modified:", sum(Current['Modified']))
+print("recently created:", sum(Current['New']))
+print("Number of right-only items:", sum(merged_table['_merge']=='right_only'))
+print("Number of left-only items:",  sum(merged_table['_merge']=='left_only'))
+
+#make a list representing left only - this is the basic list that will be modified 
+left_onlyList = merged_table.loc[merged_table['Left_onlyBool']==True,'FullName_x'].tolist()
+
+###IDENTIFY FILES THAT WERE MISTAKENLY INCLUDED AS DELETED
+#Identify duplicates that represent the second or later occurrance of that duplicate
+Original["DoubleDups"] = (Original['g'] > 0)
+#Put doubledup filehashes to list
+DoubleDupList = Original.loc[Original['DoubleDups']==True,'FileHash'].tolist()
+#flag the doubledups on the merge table
+merged_table['DoubleDups'] = merged_table['FileHash'].isin(DoubleDupList)
+#identify the doubledups which were also deleted
+merged_table["DoubleDupsAndLeftOnly"] = (merged_table.DoubleDups) & (merged_table.Left_onlyBool)
+#put the titles of the doubledups left behind into list
+DupIssueList2 = merged_table.loc[merged_table['DoubleDupsAndLeftOnly']==True,'title_x'].tolist()
+#run doubledups-left-behind list against merged table list 
+merged_table['DoubleDupsOnCurrent'] = merged_table['title_y'].isin(DupIssueList2)
+#put list of fullpaths that appeared to be left behind but both filehash and title survived into list
+DupsMistakenlyConsideredDeleted = merged_table.loc[merged_table['DoubleDupsOnCurrent']==True,'FullName_y'].tolist()
+print("Title in current matches deleted:", len(DupsMistakenlyConsideredDeleted))
+#if a title and hash in column y have the same filepath as one from the list of deletions, it is a definitive sign that it was not deleted
+merged_table['FullPathMatch'] = merged_table['FullName_y'].isin(DupsMistakenlyConsideredDeleted)
+FullPathMatch = merged_table.loc[merged_table['FullPathMatch']==True,'FullName_y'].tolist()
+print("fullpath in current matches deleted:", len(FullPathMatch))
+
+####IDENTIFY FILES THAT WERE MISTAKENLY INCLUDED AS SURVIVORS
+#Above, you identified doubledups on the current list based on title from the original list. 
+WrongSurvivors = merged_table.loc[merged_table['DoubleDupsOnCurrent']==True,'FullName_x'].tolist()
+
+#print(FullPathMatch)
+#print("Number of wrong survivors:", WrongSurvivors)
+
+zipped = zip(FullPathMatch, WrongSurvivors)
+
+df = pd.DataFrame(zipped, columns = ['LeftBehind', 'WrongSurvivors'])
+
+df.to_csv("PotentialDuplicateProblems.csv")
+
+###IDENTIFY FILES THAT WERE MODIFIED DURING DELETIONS
+
+#create a column that indicates if the list above (representing modified files) matches with a file name in the left_only column (the so-called deleted files)
+merged_table['ModifiedNotDeleted'] = merged_table['title_x'].isin(list_of_ModifiedRecentlyButNotNew)
+merged_table['ModifiedNotDeletedFinal'] = (merged_table.ModifiedNotDeleted) & (merged_table.Left_onlyBool)
+ModifiedNotDeleted = merged_table.loc[merged_table['ModifiedNotDeletedFinal']==True,'FullName_x'].tolist()
+
+print("Modified not deleted:", len(ModifiedNotDeleted))
+
+print("Left only list:", len(left_onlyList))
+left_onlyList = [x for x in left_onlyList if x not in ModifiedNotDeleted]
+print("Left only list after modified remove:", len(left_onlyList))
+left_onlyList = [x for x in left_onlyList if x not in FullPathMatch]
+print("Left only list after mistaken dups deletes removed:", len(left_onlyList))
+left_onlyList.extend(WrongSurvivors)
+#print("New:", Current.New.sum())
+
+print("Left only list after wrong survivors added:", len(left_onlyList))
+
+#df = pd.DataFrame(left_onlyList,columns=['Files deleted'])
+#
+#df.to_csv("FilesDeleted.csv")
+
+#Note: if you catch a right-only bool with an identical filepath to left_only, you may want to investigate by taking off the "&" here
+merged_table['FinalCount'] = (merged_table['FullName_x'].isin(left_onlyList) | merged_table['FullName_y'].isin(left_onlyList)) & (merged_table.Right_onlyBool == False)
+
+merged_table.drop(merged_table[merged_table['FinalCount'] == False ].index , inplace=True)
+print(merged_table.columns.values)
+
+
+merged_table = merged_table.loc[:,['FileHash','FullName_x','Created_x','LastWriteTime_x']]
+#
+#
+merged_table.to_csv("DepartmentNameDeletionsDetails.csv")
